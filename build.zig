@@ -319,8 +319,37 @@ fn generateTables(
     gen_mod.addImport("config.zig", config_mod);
     gen_mod.addImport("storage.zig", storage_mod);
     gen_mod.addImport("build_config", build_config_mod);
-    const run_gen_exe = b.addRunArtifact(gen_exe);
+
+    // Run the generator without letting the compiled binary's *content* become
+    // part of the Run step's cache key (jacobsandlund/uucode#6).
+    //
+    // `b.addRunArtifact` / `addArtifactArg` hash the generator executable's
+    // bytes into the Run manifest. Under `-fincremental` the compiler rewrites
+    // that binary in place on every build and the output is not
+    // byte-reproducible, so the hash changes every time even when nothing
+    // relevant changed. That is a guaranteed cache miss, which re-runs the
+    // (multi-second) table generation on every incremental build.
+    //
+    // Instead we pass the executable as a path *string* argument (hashing only
+    // the resolved path, never the volatile bytes) and declare the generator's
+    // real determinants -- its Zig sources, the `build_config`, and the `ucd/`
+    // data files it reads at run time -- as explicit file inputs. This keeps
+    // the run cached when nothing changed while still regenerating the tables
+    // whenever any of those inputs change. Explicit inputs are required for
+    // correctness under `-fincremental`: there the compiler keeps a *stable*
+    // output path (rewriting in place), so the path string alone would not
+    // change on a source edit. `addStepDependencies` on the emitted-binary
+    // directory keeps the build-ordering dependency on the compile step.
+    const run_gen_exe = std.Build.Step.Run.create(b, "run uucode_generate");
+    run_gen_exe.addDecoratedDirectoryArg(
+        "",
+        gen_exe.getEmittedBin().dirname(),
+        b.fmt("{c}{s}", .{ std.fs.path.sep, gen_exe.out_filename }),
+    );
     run_gen_exe.setCwd(b.path(""));
+    run_gen_exe.addFileInput(build_config_path);
+    addTreeInputs(b, run_gen_exe, "src", ".zig", false);
+    addTreeInputs(b, run_gen_exe, "ucd", ".txt", true);
     const tables_path = run_gen_exe.addOutputFileArg("tables.zig");
 
     return .{
@@ -328,6 +357,45 @@ fn generateTables(
         .generate = gen_mod,
         .build_config = build_config_mod,
     };
+}
+
+/// Declare every file with `ext` under `sub_path` (relative to the build root)
+/// as an input of `run`, so the run re-executes when any of them changes. Used
+/// to key the table generator on its real inputs rather than on its (under
+/// `-fincremental`, non-reproducible) compiled binary -- see `generateTables`.
+fn addTreeInputs(
+    b: *std.Build,
+    run: *std.Build.Step.Run,
+    sub_path: []const u8,
+    ext: []const u8,
+    recursive: bool,
+) void {
+    const io = b.graph.io;
+    var dir = b.build_root.handle.openDir(io, sub_path, .{ .iterate = true }) catch |err|
+        std.debug.panic("unable to open '{s}' for table-generator inputs: {t}", .{ sub_path, err });
+    defer dir.close(io);
+
+    if (recursive) {
+        var walker = dir.walk(b.allocator) catch @panic("OOM");
+        defer walker.deinit();
+        while (walker.next(io) catch |err|
+            std.debug.panic("unable to walk '{s}': {t}", .{ sub_path, err })) |entry|
+        {
+            if (entry.kind != .file or !std.mem.endsWith(u8, entry.basename, ext)) continue;
+            const rel = b.fmt("{s}/{s}", .{ sub_path, entry.path });
+            // `Walker` uses the host path separator; `b.path` wants '/'.
+            std.mem.replaceScalar(u8, rel, std.fs.path.sep, '/');
+            run.addFileInput(b.path(rel));
+        }
+    } else {
+        var it = dir.iterate();
+        while (it.next(io) catch |err|
+            std.debug.panic("unable to iterate '{s}': {t}", .{ sub_path, err })) |entry|
+        {
+            if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ext)) continue;
+            run.addFileInput(b.path(b.fmt("{s}/{s}", .{ sub_path, entry.name })));
+        }
+    }
 }
 
 fn createLibMod(
