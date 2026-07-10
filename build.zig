@@ -129,6 +129,7 @@ pub fn build(b: *std.Build) void {
         .Debug,
         tables_path_opt,
         build_config_path,
+        "main",
     );
 
     // b.addModule with an existing module
@@ -149,6 +150,7 @@ pub fn build(b: *std.Build) void {
         .Debug,
         null,
         b.path("src/test/build_config.zig"),
+        "test",
     );
 
     const src_tests = b.addTest(.{
@@ -272,6 +274,9 @@ fn generateTables(
     b: *std.Build,
     build_config_path: std.Build.LazyPath,
     generate_optimize: std.builtin.OptimizeMode,
+    // Distinguishes concurrent generator instances (e.g. the real module vs the
+    // test module) so their staged-exe paths do not collide.
+    stable_tag: []const u8,
 ) struct {
     generate: *std.Build.Module,
     build_config: *std.Build.Module,
@@ -320,32 +325,48 @@ fn generateTables(
     gen_mod.addImport("storage.zig", storage_mod);
     gen_mod.addImport("build_config", build_config_mod);
 
-    // Run the generator without letting the compiled binary's *content* become
-    // part of the Run step's cache key (jacobsandlund/uucode#6).
+    // Generate the tables by running the compiled generator, keyed *only* on
+    // the generator's real inputs -- its Zig sources, `build_config`, and the
+    // `ucd/` data files -- and never on the generator binary itself
+    // (jacobsandlund/uucode#6).
     //
-    // `b.addRunArtifact` / `addArtifactArg` hash the generator executable's
-    // bytes into the Run manifest. Under `-fincremental` the compiler rewrites
-    // that binary in place on every build and the output is not
-    // byte-reproducible, so the hash changes every time even when nothing
-    // relevant changed. That is a guaranteed cache miss, which re-runs the
-    // (multi-second) table generation on every incremental build.
+    // A Zig Run step always folds its argv into the cache key, and argv[0] is
+    // the generator exe. Under `-fincremental` that exe is poison for caching:
+    // its bytes are not byte-reproducible AND its compiler output directory
+    // shifts whenever any unrelated module in the graph changes (e.g. editing a
+    // downstream kernel that also builds under `-fincremental`). So keying on it
+    // at all -- by content (`addArtifactArg`) or by path
+    // (`addDecoratedDirectoryArg`) -- misses on essentially every incremental
+    // build and re-runs the multi-second generation. On a normal build none of
+    // this happens: the exe is content-addressed and stable, so the run caches.
     //
-    // Instead we pass the executable as a path *string* argument (hashing only
-    // the resolved path, never the volatile bytes) and declare the generator's
-    // real determinants -- its Zig sources, the `build_config`, and the `ucd/`
-    // data files it reads at run time -- as explicit file inputs. This keeps
-    // the run cached when nothing changed while still regenerating the tables
-    // whenever any of those inputs change. Explicit inputs are required for
-    // correctness under `-fincremental`: there the compiler keeps a *stable*
-    // output path (rewriting in place), so the path string alone would not
-    // change on a source edit. `addStepDependencies` on the emitted-binary
-    // directory keeps the build-ordering dependency on the compile step.
-    const run_gen_exe = std.Build.Step.Run.create(b, "run uucode_generate");
-    run_gen_exe.addDecoratedDirectoryArg(
-        "",
-        gen_exe.getEmittedBin().dirname(),
-        b.fmt("{c}{s}", .{ std.fs.path.sep, gen_exe.out_filename }),
+    // This is the build-system equivalent of a Makefile *order-only*
+    // prerequisite (`tables.zig: $(SRC) $(UCD) | uucode_generate`): we stage the
+    // freshly-built exe to a fixed path and pass that constant string as argv[0]
+    // (so the exe contributes nothing volatile to the key), depend on the
+    // staging step purely for ordering, and declare the true determinants as
+    // explicit file inputs. The run then caches exactly like a normal build --
+    // regenerating only when a real input changes -- incremental or not. (It
+    // does not, and cannot, stop `-fincremental` from re-compiling the generator
+    // exe every build; that is a global toolchain flag with no per-step opt-out.
+    // Only the far more expensive table *generation* is cached here.)
+    const stable_exe_abs = b.pathResolve(&.{
+        b.graph.cache.cwd,
+        b.cache_root.path orelse ".",
+        "uucode-gen",
+        stable_tag,
+        gen_exe.out_filename,
+    });
+    const stage_exe = StageExe.create(
+        b,
+        b.fmt("stage uucode_generate ({s})", .{stable_tag}),
+        gen_exe.getEmittedBin(),
+        stable_exe_abs,
     );
+
+    const run_gen_exe = std.Build.Step.Run.create(b, "run uucode_generate");
+    run_gen_exe.addArg(stable_exe_abs);
+    run_gen_exe.step.dependOn(&stage_exe.step);
     run_gen_exe.setCwd(b.path(""));
     run_gen_exe.addFileInput(build_config_path);
     addTreeInputs(b, run_gen_exe, "src", ".zig", false);
@@ -398,6 +419,50 @@ fn addTreeInputs(
     }
 }
 
+/// Copies the freshly-compiled generator to a fixed path so the table-generation
+/// Run step can reference a *stable* argv[0] whose string never varies between
+/// builds. See `generateTables` for why that is required under `-fincremental`.
+/// The step has no cached output, so it re-copies every build, always leaving a
+/// fresh binary at the stable path for when the (input-keyed) Run actually runs.
+const StageExe = struct {
+    step: std.Build.Step,
+    src: std.Build.LazyPath,
+    dest_abs: []const u8,
+
+    fn create(
+        b: *std.Build,
+        name: []const u8,
+        src: std.Build.LazyPath,
+        dest_abs: []const u8,
+    ) *StageExe {
+        const self = b.allocator.create(StageExe) catch @panic("OOM");
+        self.* = .{
+            .step = std.Build.Step.init(.{
+                .id = .custom,
+                .name = name,
+                .owner = b,
+                .makeFn = make,
+            }),
+            .src = src,
+            .dest_abs = dest_abs,
+        };
+        src.addStepDependencies(&self.step);
+        return self;
+    }
+
+    fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+        _ = options;
+        const b = step.owner;
+        const self: *StageExe = @fieldParentPtr("step", step);
+        const src_abs = b.pathResolve(&.{ b.graph.cache.cwd, self.src.getPath2(b, step) });
+        std.Io.Dir.copyFileAbsolute(src_abs, self.dest_abs, b.graph.io, .{
+            .make_path = true,
+            .replace = true,
+        }) catch |err|
+            return step.fail("unable to stage uucode_generate to '{s}': {t}", .{ self.dest_abs, err });
+    }
+};
+
 fn createLibMod(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -405,6 +470,7 @@ fn createLibMod(
     generate_optimize: std.builtin.OptimizeMode,
     tables_path_opt: ?std.Build.LazyPath,
     build_config_path: std.Build.LazyPath,
+    stable_tag: []const u8,
 ) struct {
     lib: *std.Build.Module,
     build_config: *std.Build.Module,
@@ -444,7 +510,7 @@ fn createLibMod(
     var generate: ?*std.Build.Module = null;
     var gen_build_config: ?*std.Build.Module = null;
     const tables_path = tables_path_opt orelse blk: {
-        const t = generateTables(b, build_config_path, generate_optimize);
+        const t = generateTables(b, build_config_path, generate_optimize, stable_tag);
         generate = t.generate;
         gen_build_config = t.build_config;
         break :blk t.tables;
